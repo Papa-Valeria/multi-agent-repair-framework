@@ -1,0 +1,34 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Verifica Prerequisiti Locali",
+      "type": "shell",
+      "command": "git --version && semgrep --version && curl -s http://localhost:11434/api/tags > /dev/null && echo 'Tutti i servizi locali sono attivi!' || echo 'Verifica che Semgrep sia nel PATH e Ollama sia in esecuzione.'",
+      "problemMatcher": []
+    },
+    {
+      "label": "Start All (Server + Client)",
+      "dependsOn": ["Start Server", "Start Client"],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Start Server",
+      "type": "npm",
+      "script": "start:server",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Start Client",
+      "type": "npm",
+      "script": "dev:client",
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}

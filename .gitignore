@@ -1,0 +1,125 @@
+# ==========================================
+# File di Ambiente e Segreti (RNF-01)
+# ==========================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ==========================================
+# Node.js / TypeScript
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Directory di compilazione / Build output
+dist/
+build/
+out/
+.tsbuildinfo
+
+# Cache di Vite e Bundler
+.vite/
+.turbo/
+.parcel-cache/
+
+# ==========================================
+# Patch temporanee del Framework (GitManager)
+# ==========================================
+# Evita di committare i file diff di dry-run atomico o applicazione
+.tmp_eval_*.patch
+.tmp_apply_*.patch
+*.diff
+*.patch
+
+# ==========================================
+# Python / Test Harness (Pytest / Target Repo)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Pytest e Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ==========================================
+# Semgrep e Report Diagnostici
+# ==========================================
+semgrep_report.json
+.semgrep/
+.semgrep_cache/
+*.sarif
+*.sarif.json
+
+# ==========================================
+# Log e Telemetria Locale
+# ==========================================
+logs/
+*.log
+telemetry_logs/
+session_data/
+
+# ==========================================
+# Editor e IDE (VS Code, JetBrains)
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ==========================================
+# File di Sistema Operativo
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
