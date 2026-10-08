@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, ChildProcess } from 'node:child_process';
 
 export interface ProcessResult {
   readonly exitCode: number | null;
@@ -6,6 +6,7 @@ export interface ProcessResult {
   readonly stderr: string;
   readonly timedOut: boolean;
   readonly durationMs: number;
+  readonly executionError?: string;
 }
 
 export class ProcessRunner {
@@ -17,7 +18,26 @@ export class ProcessRunner {
   ): Promise<ProcessResult> {
     return new Promise((resolve) => {
       const t0 = performance.now();
-      const child = spawn(command, [...args], { cwd, shell: false });
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(command, [...args], {
+          cwd,
+          shell: false,
+          detached: process.platform !== 'win32',
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+      } catch (err: unknown) {
+        resolve({
+          exitCode: null,
+          stdout: '',
+          stderr: '',
+          timedOut: false,
+          durationMs: performance.now() - t0,
+          executionError: (err as Error).message
+        });
+        return;
+      }
 
       let stdout = '';
       let stderr = '';
@@ -25,14 +45,14 @@ export class ProcessRunner {
 
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill('SIGKILL');
+        ProcessRunner.killProcessTree(child);
       }, timeoutMs);
 
-      child.stdout.on('data', (data: Buffer) => {
+      child.stdout?.on('data', (data: Buffer) => {
         stdout += data.toString('utf-8');
       });
 
-      child.stderr.on('data', (data: Buffer) => {
+      child.stderr?.on('data', (data: Buffer) => {
         stderr += data.toString('utf-8');
       });
 
@@ -50,13 +70,48 @@ export class ProcessRunner {
       child.on('error', (err) => {
         clearTimeout(timer);
         resolve({
-          exitCode: 1,
+          exitCode: null,
           stdout,
           stderr: `${stderr}\n${err.message}`,
           timedOut: false,
-          durationMs: performance.now() - t0
+          durationMs: performance.now() - t0,
+          executionError: err.message
         });
       });
     });
+  }
+
+  private static killProcessTree(child: ChildProcess): void {
+    const childPid = child.pid;
+    if (childPid === undefined) {
+      child.kill('SIGKILL');
+      return;
+    }
+
+    if (process.platform === 'win32') {
+      let killer: ChildProcess;
+      try {
+        killer = spawn('taskkill', ['/pid', String(childPid), '/T', '/F'], {
+          shell: false,
+          windowsHide: true,
+          stdio: 'ignore'
+        });
+      } catch {
+        child.kill('SIGKILL');
+        return;
+      }
+
+      killer.once('error', () => child.kill('SIGKILL'));
+      killer.once('close', (code) => {
+        if (code !== 0) child.kill('SIGKILL');
+      });
+      return;
+    }
+
+    try {
+      process.kill(-childPid, 'SIGKILL');
+    } catch {
+      child.kill('SIGKILL');
+    }
   }
 }

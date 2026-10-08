@@ -5,8 +5,17 @@ export interface SastFinding {
   readonly endLine: number;
   readonly severity: 'ERROR' | 'WARNING' | 'INFO';
   readonly message: string;
-  readonly cweHierarchy?: readonly string[];
+  readonly cweHierarchy?: readonly string[] | undefined;
   readonly owaspCategory?: string | undefined;
+}
+
+export interface TestFailureDetail {
+  readonly testName: string;
+  readonly failureLocation?: { readonly file: string; readonly line: number } | undefined;
+  readonly assertionMessage: string;
+  readonly stackTrace: string;
+  readonly expected?: string | undefined;
+  readonly actual?: string | undefined;
 }
 
 export interface TestExecutionReport {
@@ -14,7 +23,7 @@ export interface TestExecutionReport {
   readonly suitePassed: boolean;
   readonly timedOut: boolean;
   readonly oracleFailed: boolean;
-  readonly oracleFailureReason?: string;
+  readonly oracleFailureReason?: string | undefined;
   readonly totalTests: number;
   readonly passedTests: number;
   readonly failedTests: number;
@@ -23,53 +32,12 @@ export interface TestExecutionReport {
   readonly errorTests: number;
   readonly passRate: number;
   readonly durationMs: number;
-  readonly failureDetails: ReadonlyArray<{
-    readonly testName: string;
-    readonly failureLocation?: { readonly file: string; readonly line: number };
-    readonly assertionMessage: string;
-    readonly stackTrace: string;
-    readonly expected?: string;
-    readonly actual?: string;
-  }>;
+  readonly failureDetails: readonly TestFailureDetail[];
   readonly stdout: string;
   readonly stderr: string;
-  readonly rawStdout?: string;
-  readonly rawStderr?: string;
+  readonly rawStdout?: string | undefined;
+  readonly rawStderr?: string | undefined;
   readonly executionDurationMs: number;
-}
-
-export interface VerificationVerdict {
-  readonly verified: boolean;
-  readonly sastFindings: readonly SastFinding[];
-  readonly semgrepDurationMs?: number;
-  readonly testReport: TestExecutionReport;
-}
-
-export type AgentRole = 'CODER' | 'REVIEWER';
-
-export interface AgentUsage {
-  readonly promptTokens: number;
-  readonly completionTokens: number;
-  readonly inferenceDurationMs: number;
-}
-
-export interface PatchChangeMetrics {
-  readonly addedLines: number;
-  readonly deletedLines: number;
-}
-
-export interface ReviewerFeedbackPayload {
-  readonly rootCauseSummary: string;
-  readonly violationsPrunedCount: number;
-  readonly targetRemediations: ReadonlyArray<{
-    readonly file: string;
-    readonly lineRange: { readonly start: number; readonly end: number };
-    readonly rootCause: string;
-    readonly mandatoryCorrection: string;
-    readonly relatedRuleId?: string;
-  }>;
-  readonly securityPriorityStrict: boolean;
-  readonly flappingDetected: boolean;
 }
 
 export interface ComputationalTelemetry {
@@ -79,7 +47,22 @@ export interface ComputationalTelemetry {
   oracleDurationMs: number;
   orchestrationOverheadMs: number;
   totalDurationMs: number;
-  agentUsage: Readonly<Record<AgentRole, AgentUsage>>;
+}
+
+export interface ReviewerRemediation {
+  readonly file: string;
+  readonly lineRange: { readonly start: number; readonly end: number };
+  readonly rootCause: string;
+  readonly mandatoryCorrection: string;
+  readonly relatedRuleId?: string | undefined;
+}
+
+export interface ReviewerFeedbackPayload {
+  readonly rootCauseSummary: string;
+  readonly violationsPrunedCount: number;
+  readonly targetRemediations: readonly ReviewerRemediation[];
+  readonly securityPriorityStrict: boolean;
+  readonly flappingDetected: boolean;
 }
 
 export interface IterationRecord {
@@ -87,13 +70,13 @@ export interface IterationRecord {
   readonly patchDiff: string;
   readonly patchHash: string;
   readonly isApplicable: boolean;
-  readonly verification: VerificationVerdict;
-  readonly reviewerFeedback?: ReviewerFeedbackPayload;
+  readonly verification: {
+    readonly verified: boolean;
+    readonly sastFindings: readonly SastFinding[];
+    readonly testReport: TestExecutionReport;
+  };
+  readonly reviewerFeedback?: ReviewerFeedbackPayload | undefined;
   readonly telemetry: ComputationalTelemetry;
-  readonly agentUsage?: Readonly<Record<AgentRole, AgentUsage>>;
-  readonly patchChanges?: PatchChangeMetrics;
-  readonly applyMode?: 'GIT' | 'FUZZY' | 'NOT_APPLICABLE';
-  readonly fuzzyFallbackUsed?: boolean;
 }
 
 export interface WorkbenchSessionState {
@@ -108,7 +91,7 @@ export interface WorkbenchSessionState {
   readonly finalPatch?: string | undefined;
   readonly approvalCommitHash?: string | undefined;
   readonly cumulativeTelemetry: ComputationalTelemetry;
-  readonly isHumanAugmented?: boolean;
+  readonly isHumanAugmented?: boolean | undefined;
 }
 
 export type WorkbenchStreamEvent =

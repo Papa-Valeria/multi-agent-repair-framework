@@ -8,15 +8,18 @@
     "start:server": "tsx src/server/app.ts",
     "dev:client": "vite client",
     "build:client": "vite build client",
+    "benchmark:run": "tsx benchmarks/BenchmarkRunner.ts",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --detectOpenHandles"
   },
   "dependencies": {
+    "@fastify/cors": "^9.0.1",
     "@monaco-editor/react": "^4.7.0",
     "fastify": "^4.26.2",
     "lucide-react": "^0.359.0",
     "monaco-editor": "^0.47.0",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",

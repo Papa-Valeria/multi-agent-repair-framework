@@ -1,8 +1,10 @@
 import { ProcessRunner } from './ProcessRunner.js';
 import { DiffScoper } from './DiffScoper.js';
 import { SastFinding } from '../types/domain.js';
+import { ExperimentCategory } from '../types/analytics.js';
 
 interface RawSemgrepOutput {
+  readonly errors?: ReadonlyArray<{ readonly message?: string }>;
   readonly results?: ReadonlyArray<{
     readonly check_id: string;
     readonly path: string;
@@ -20,23 +22,47 @@ interface RawSemgrepOutput {
 }
 
 export class SemgrepEngine {
-  constructor(private readonly repoRoot: string) {}
+  public lastScanDurationMs = 0;
 
-  public async scan(targetFiles: readonly string[], patchDiff: string): Promise<readonly SastFinding[]> {
-    if (targetFiles.length === 0) return [];
+  constructor(private readonly repoRoot: string) { }
+
+  public async scan(
+    targetFiles: readonly string[],
+    patchDiff: string,
+    category: ExperimentCategory = 'REPAIR'
+  ): Promise<readonly SastFinding[]> {
+    this.lastScanDurationMs = 0;
+
+    if (targetFiles.length === 0) {
+      throw new Error('Semgrep non può verificare una patch senza file target.');
+    }
 
     const args = [
       'scan',
       '--config=auto',
       '--config=p/owasp-top-ten',
-      '--config=p/cwe',
+      '--config=p/security-audit',
+      '--config=p/cwe-top-25',
+      '--config=p/python',
       '--json',
       ...targetFiles
     ];
 
     const result = await ProcessRunner.execute('semgrep', args, this.repoRoot, 60000);
+    this.lastScanDurationMs = result.durationMs;
+
+    if (result.timedOut) {
+      throw new Error('Semgrep ha superato il timeout di 60 secondi.');
+    }
+
+    if (result.executionError) {
+      throw new Error(`Impossibile eseguire Semgrep: ${result.executionError}`);
+    }
+
     if (!result.stdout.trim()) {
-      return [];
+      throw new Error(
+        `Semgrep non ha prodotto un report JSON (exit code ${result.exitCode ?? 'null'}). ${result.stderr}`.trim()
+      );
     }
 
     let parsed: RawSemgrepOutput;
@@ -46,7 +72,22 @@ export class SemgrepEngine {
       throw new Error(`Parsing fallito per l'output JSON di Semgrep: ${result.stderr}`);
     }
 
-    const rawFindings: SastFinding[] = (parsed.results ?? []).map((item) => {
+    if (!Array.isArray(parsed.results)) {
+      throw new Error("Il report JSON di Semgrep non contiene l'array 'results' atteso.");
+    }
+
+    if (parsed.errors && parsed.errors.length > 0) {
+      const errMsgs = parsed.errors.map((e) => e.message ?? 'errore sconosciuto').join('; ');
+      throw new Error(`Semgrep ha riportato errori nell'esecuzione delle regole: ${errMsgs}`);
+    }
+
+    if (result.exitCode !== 0 && !(result.exitCode === 1 && parsed.results.length > 0)) {
+      if (parsed.results.length === 0) {
+        throw new Error(`Semgrep è terminato con codice ${result.exitCode}: ${result.stderr}`.trim());
+      }
+    }
+
+    const rawFindings: SastFinding[] = parsed.results.map((item) => {
       const sev = (item.extra?.severity ?? 'WARNING').toUpperCase();
       const mappedSeverity: 'ERROR' | 'WARNING' | 'INFO' =
         sev === 'ERROR' ? 'ERROR' : sev === 'INFO' ? 'INFO' : 'WARNING';
@@ -71,8 +112,7 @@ export class SemgrepEngine {
       };
     });
 
-    // Applica diff-aware scoping (RF-04)
     const modifiedRanges = DiffScoper.extractModifiedLineRanges(patchDiff);
-    return DiffScoper.filterFindings(rawFindings, modifiedRanges);
+    return DiffScoper.filterFindings(rawFindings, modifiedRanges, targetFiles, category);
   }
 }

@@ -90,6 +90,7 @@ logs/
 *.log
 telemetry_logs/
 session_data/
+experiments_log/
 
 # ==========================================
 # Editor e IDE (VS Code, JetBrains)

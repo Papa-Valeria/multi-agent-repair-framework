@@ -1,9 +1,12 @@
 import { TelemetryTracker } from '../telemetry/TelemetryTracker.js';
+import { AgentRole } from '../types/domain.js';
 
 export interface InferenceConfig {
-  readonly baseUrl: string; // e.g. "http://127.0.0.1:11434/v1" o "http://127.0.0.1:8000/v1"
-  readonly model: string;   // e.g. "qwen2.5-coder:32b", "deepseek-coder"
+  readonly baseUrl: string;
+  readonly model: string;
   readonly seed?: number;
+  readonly temperature?: number;
+  readonly topP?: number;
 }
 
 export interface ChatMessage {
@@ -21,22 +24,50 @@ interface ChatCompletionResponse {
   };
 }
 
+interface ModelListResponse {
+  readonly data?: ReadonlyArray<{ readonly id?: string }>;
+}
+
 export class OpenAICompatibleClient {
   constructor(
     private readonly config: InferenceConfig,
     private readonly telemetryTracker: TelemetryTracker
   ) {}
 
-  public async completeChat(messages: readonly ChatMessage[]): Promise<string> {
+  public async validateEndpoint(timeoutMs = 5000): Promise<void> {
+    const endpoint = `${this.config.baseUrl.replace(/\/+$/, '')}/models`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(endpoint, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`Endpoint modello non disponibile (${response.status}).`);
+      }
+
+      const data = await response.json() as ModelListResponse;
+      const availableModels = data.data?.flatMap((entry) => entry.id ? [entry.id] : []) ?? [];
+      if (availableModels.length > 0 && !availableModels.includes(this.config.model)) {
+        throw new Error(`Modello '${this.config.model}' non esposto dall’endpoint. Disponibili: ${availableModels.join(', ')}.`);
+      }
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Timeout ${timeoutMs} ms durante la verifica dell’endpoint modello.`);
+      }
+      throw new Error(`Impossibile verificare l’endpoint modello ${endpoint}: ${(error as Error).message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  public async completeChat(messages: readonly ChatMessage[], role: AgentRole = 'CODER'): Promise<string> {
     const t0 = performance.now();
     const endpoint = `${this.config.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
-    // Parametri deterministici (RNF-03)
     const payload = {
       model: this.config.model,
       messages,
-      temperature: 0.0,
-      top_p: 1.0,
+      temperature: this.config.temperature ?? 0.0,
+      top_p: this.config.topP ?? 1.0,
       seed: this.config.seed ?? 42,
       stream: false
     };
@@ -63,7 +94,7 @@ export class OpenAICompatibleClient {
     const promptTokens = data.usage?.prompt_tokens ?? 0;
     const completionTokens = data.usage?.completion_tokens ?? 0;
 
-    this.telemetryTracker.recordLLMUsage(promptTokens, completionTokens, durationMs);
+    this.telemetryTracker.recordLLMUsage(role, promptTokens, completionTokens, durationMs);
 
     const content = data.choices[0]?.message.content;
     if (typeof content !== 'string') {

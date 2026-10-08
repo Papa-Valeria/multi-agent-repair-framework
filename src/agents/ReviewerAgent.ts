@@ -62,7 +62,8 @@ Operational Constraints:
   public async review(
     sastFindings: readonly SastFinding[],
     testReport: TestExecutionReport,
-    flappingDetected: boolean
+    flappingDetected: boolean,
+    targetFiles: readonly string[] = []
   ): Promise<ReviewerFeedbackPayload> {
     const { criticalFindings, conciseTestErrors } = this.pruneAndAggregate(sastFindings, testReport);
 
@@ -86,7 +87,7 @@ Operational Constraints:
     ];
 
     try {
-      const raw = await this.client.completeChat(messages);
+      const raw = await this.client.completeChat(messages, 'REVIEWER');
 
       // Estrazione del blocco JSON tollerando testo discorsivo o markdown
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -111,34 +112,35 @@ Operational Constraints:
       return parsed;
     } catch (err: unknown) {
       console.warn('[ReviewerAgent] Errore inferenza o parsing JSON, attivazione fallback deterministico:', (err as Error)?.message);
+      // Fallback uguale per ogni modello: riporta solo i risultati degli oracle, senza indicare la soluzione.
       const remediations: MutableRemediation[] = [];
+      const fallbackFile = targetFiles[0] ?? 'unknown';
 
-      // 1. Violazioni SAST
       for (const f of criticalFindings) {
         remediations.push({
           file: f.path,
           lineRange: { start: f.startLine, end: f.endLine },
           rootCause: `Violazione regola SAST ${f.ruleId}: ${f.message}`,
-          mandatoryCorrection: 'Risolvere la vulnerabilita sostituendo la query dinamica o concatenata con una query statica o parametrizzata sicura (es. SELECT * FROM tokens WHERE t = ?).',
+          mandatoryCorrection: `Eliminare la violazione ${f.ruleId} alle righe ${f.startLine}-${f.endLine} senza alterare il comportamento atteso dai test.`,
           relatedRuleId: f.ruleId
         });
       }
 
-      // 2. Fallimento Test funzionali
       if (!testReport.suitePassed) {
-        const failureMsg = testReport.failureDetails[0]?.assertionMessage || 'AssertionError';
+        const failure = testReport.failureDetails[0];
+        const failureMsg = failure?.assertionMessage || 'Fallimento della suite di test';
         remediations.push({
-          file: 'service.py',
-          lineRange: { start: 1, end: 4 },
-          rootCause: `Fallimento Test Suite: ${failureMsg}`,
-          mandatoryCorrection: 'Explicitly replace the line `return False` with `return True` using diff markers (`-    return False` and `+    return True`).'
+          file: fallbackFile,
+          lineRange: { start: 1, end: 1 },
+          rootCause: `${failure?.testName ?? 'TestFailure'}: ${failureMsg}`,
+          mandatoryCorrection: 'Correggere il codice sorgente target in modo che la suite di test passi, mantenendo sintassi valida e rispettando le asserzioni riportate.'
         });
       }
 
       const summary = !testReport.suitePassed && criticalFindings.length > 0
-        ? 'Rilevate sia violazioni di sicurezza SAST (SQL Injection) sia fallimenti funzionali (assert False is True).'
+        ? 'Rilevate sia violazioni SAST sia fallimenti della suite di test.'
         : !testReport.suitePassed
-          ? `Fallimento funzionale: ${testReport.failureDetails[0]?.assertionMessage || 'AssertionError'}`
+          ? `Fallimento funzionale: ${testReport.failureDetails[0]?.assertionMessage || 'suite di test non superata'}`
           : 'Rilevate violazioni di sicurezza SAST.';
 
       return {
