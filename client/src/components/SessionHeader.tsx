@@ -1,10 +1,18 @@
 import React from 'react';
+import type {
+  AutonomousPipelineStatus,
+  LivePipelinePhase,
+  PipelineFinalizationStatus
+} from '../types.js';
+
 
 interface Props {
   readonly taskId: string;
-  readonly status: string;
+  readonly autonomousStatus: AutonomousPipelineStatus | null;
+  readonly finalizationStatus: PipelineFinalizationStatus;
+  readonly isHumanAugmented: boolean;
   readonly targetFiles: readonly string[];
-  readonly currentPhase: string;
+  readonly livePhase: LivePipelinePhase | null;
   readonly iterationsCount: number;
   readonly selectedIteration: number;
   readonly onSelectIteration: (iter: number) => void;
@@ -12,24 +20,17 @@ interface Props {
 
 export const SessionHeader: React.FC<Props> = ({
   taskId,
-  status,
+  autonomousStatus,
+  finalizationStatus,
+  isHumanAugmented,
   targetFiles,
-  currentPhase,
+  livePhase,
   iterationsCount,
   selectedIteration,
   onSelectIteration
 }) => {
-  const getBadgeColor = (s: string) => {
-    switch (s) {
-      case 'CONVERGED':
-      case 'APPROVED': return '#4ec9b0';
-      case 'FAILED':
-      case 'REJECTED': return '#f48771';
-      case 'UNRESOLVED': return '#cca700';
-      default: return '#007acc';
-    }
-  };
-
+  const targetLabel = targetFiles.length > 0 ? targetFiles.join(', ') : 'Nessun target';
+  const phaseLabel = livePhase ?? 'IDLE';
   return (
     <header style={{
       background: '#1f1f1f',
@@ -41,33 +42,38 @@ export const SessionHeader: React.FC<Props> = ({
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
             <h1 style={{ margin: 0, fontSize: '1.2rem', color: '#fff', fontWeight: 600 }}>
-              Task Session: <code style={{ color: '#9cdcfe' }}>{taskId || 'IDLE'}</code>
+              Task Session:{' '}<code style={{ color: '#9cdcfe' }}>{taskId || 'IDLE'}</code>
             </h1>
-            <span style={{
-              background: getBadgeColor(status),
-              color: '#111',
-              padding: '3px 8px',
-              borderRadius: '4px',
-              fontSize: '0.75rem',
-              fontWeight: 'bold',
-              letterSpacing: '0.5px'
-            }}>
-              {status}
-            </span>
+            <StatusBadge
+              label={autonomousStatus ?? 'INATTIVO'}
+              color={autonomousStatus === null ? '#007ACC' : autonomousStatusColor(autonomousStatus)}
+            />
+            <StatusBadge
+              label={finalizationStatus}
+              color={finalizationStatusColor(finalizationStatus)}
+            />
+            {isHumanAugmented && (
+              <StatusBadge
+                label="HUMAN-AUGMENTED"
+                color="#c586c0"
+              />
+            )}
           </div>
           <div style={{ fontSize: '0.8rem', color: '#888', marginTop: '4px' }}>
-            Target: <code>{targetFiles.join(', ') || 'service.py'}</code> | FSM State: <strong style={{ color: '#dcdcaa' }}>{currentPhase}</strong>
+            Target:{' '}<code>{targetLabel}</code>{' | '}FSM State:{' '}<strong style={{ color: '#dcdcaa' }}>{phaseLabel}</strong>
           </div>
         </div>
         {iterationsCount > 0 && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
             <span style={{ fontSize: '0.8rem', color: '#aaa', marginRight: '6px' }}>Storico Tentativi:</span>
             {Array.from({ length: iterationsCount }, (_, i) => i + 1).map((iter) => (
               <button
                 key={iter}
+                type='button'
                 onClick={() => onSelectIteration(iter)}
+                aria-pressed={selectedIteration === iter}
                 style={{
                   background: selectedIteration === iter ? '#0e639c' : '#2d2d2d',
                   color: selectedIteration === iter ? '#fff' : '#aaa',
@@ -89,3 +95,45 @@ export const SessionHeader: React.FC<Props> = ({
     </header>
   );
 };
+
+function StatusBadge({ label, color }: { readonly label: string | null; readonly color: string; }): React.JSX.Element {
+  return (
+    <span
+      style={{
+        background: color,
+        color: '#111',
+        padding: '3px 8px',
+        borderRadius: '4px',
+        fontSize: '0.75rem',
+        fontWeight: 'bold',
+        letterSpacing: '0.5px'
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+function autonomousStatusColor(status: AutonomousPipelineStatus): string {
+  switch (status) {
+    case 'CONVERGED':
+      return '#4ec9b0';
+    case 'UNRESOLVED':
+      return '#cca700';
+    case 'FAILED':
+      return '#f48771';
+    case 'INFRASTRUCTURE_ERROR':
+      return '#d16969';
+  }
+}
+
+function finalizationStatusColor(status: PipelineFinalizationStatus): string {
+  switch (status) {
+    case 'NOT_FINALIZED':
+      return '#9d9d9d';
+    case 'APPROVED':
+      return '#4ec9b0';
+    case 'REJECTED':
+      return '#f48771';
+  }
+}

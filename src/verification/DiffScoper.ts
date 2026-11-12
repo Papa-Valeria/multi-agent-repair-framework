@@ -1,5 +1,7 @@
-import { SastFinding } from '../types/domain.js';
-import { ExperimentCategory } from '../types/analytics.js';
+import type { SastFinding } from '../types/domain.js';
+import type { ExperimentCategory } from '../types/analytics.js';
+import { parseFileDiffs, type ParsedHunk } from '../git/UnifiedDiff.js';
+import { canonicalizeRepositoryPath, RepositoryPathPolicyError } from '../security/RepositoryPathPolicy.js';
 
 export interface LineRange {
   readonly start: number;
@@ -7,90 +9,291 @@ export interface LineRange {
 }
 
 export class DiffScoper {
+  private static readonly CONTEXT_LINES = 3;
+
   public static extractModifiedLineRanges(unifiedDiff: string): Map<string, LineRange[]> {
     const fileRanges = new Map<string, LineRange[]>();
-    const lines = unifiedDiff.split('\n');
-    let currentFile: string | null = null;
-    let isNewFile = false;
-    const hunkHeaderRegex = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+    const fileDiffs = parseFileDiffs(unifiedDiff);
 
-    for (const line of lines) {
-      if (line.startsWith('--- /dev/null')) {
-        isNewFile = true;
+    for (const fileDiff of fileDiffs) {
+      const filePath = this.normalizePath(fileDiff.file);
+
+      if (!filePath) {
         continue;
       }
-      if (line.startsWith('+++ b/')) {
-        currentFile = line.substring(6).trim();
-        if (!fileRanges.has(currentFile)) {
-          fileRanges.set(currentFile, []);
-        }
-        continue;
-      }
-      if (currentFile && line.startsWith('@@')) {
-        const match = hunkHeaderRegex.exec(line);
-        if (match && match[2]) {
-          const startLine = parseInt(match[2], 10);
-          const lineCount = match[3] !== undefined ? parseInt(match[3], 10) : 1;
-          const endLine = lineCount === 0 ? startLine : startLine + lineCount - 1;
 
-          // Se il file è nuovo, copre da riga 1 a endLine
-          const start = isNewFile ? 1 : Math.max(1, startLine - 3);
-          const end = endLine + (isNewFile ? 0 : 3);
+      const ranges: LineRange[] = [];
 
-          fileRanges.get(currentFile)!.push({ start, end });
-        }
+      for (const hunk of fileDiff.hunks) {
+        ranges.push(
+          ...this.extractRangesFromHunk(
+            hunk,
+            fileDiff.isNewFile
+          )
+        );
       }
+      const existingRanges = fileRanges.get(filePath) ?? [];
+      fileRanges.set(filePath, this.mergeRanges([...existingRanges, ...ranges]));
     }
+
     return fileRanges;
   }
 
   public static filterFindings(
     findings: readonly SastFinding[],
-    modifiedRanges: Map<string, LineRange[]>,
-    targetFiles: readonly string[] = [],
-    category: ExperimentCategory = 'REPAIR'
+    modifiedRanges: ReadonlyMap<
+      string,
+      readonly LineRange[]
+    >,
+    targetFiles: readonly string[],
+    category: ExperimentCategory,
+    repositoryRoot: string
   ): readonly SastFinding[] {
-    const targetSet = new Set(targetFiles.map((f) => f.replace(/\\/g, '/')));
+    const canonicalTargetFiles =
+      new Set<string>();
 
-    return findings.filter((finding) => {
-      const normalizedPath = finding.path.replace(/\\/g, '/');
-      const isTargetFile = Array.from(targetSet).some((target) => normalizedPath.endsWith(target));
+    for (const targetFile of targetFiles) {
+      const canonicalTarget =
+        this.canonicalizeForMatching(
+          repositoryRoot,
+          targetFile
+        );
 
-      // 1. In modalità CREATE: il file è generato da zero. Non esiste debito pregresso.
-      // Tutte le violazioni emerse nel file creato sono addebitate alla patch.
-      if (category === 'CREATE' && isTargetFile) {
-        return true;
+      if (canonicalTarget !== null) {
+        canonicalTargetFiles.add(
+          canonicalTarget
+        );
+      }
+    }
+
+    const canonicalModifiedRanges =
+      new Map<
+        string,
+        readonly LineRange[]
+      >();
+
+    for (
+      const [
+        filePath,
+        ranges
+      ] of modifiedRanges.entries()
+    ) {
+      const canonicalPath =
+        this.canonicalizeForMatching(
+          repositoryRoot,
+          filePath
+        );
+
+      if (canonicalPath === null) {
+        continue;
       }
 
-      // 2. In modalità REPAIR: qualsiasi violazione grave (ERROR o OWASP/CWE) presente
-      // sul file target deve essere risolta dal Coder. Non può essere ignorata.
-      if (category === 'REPAIR' && isTargetFile) {
-        const isSecurityVulnerability =
-          finding.severity === 'ERROR' ||
-          (finding.cweHierarchy && finding.cweHierarchy.length > 0) ||
-          Boolean(finding.owaspCategory);
+      canonicalModifiedRanges.set(
+        canonicalPath,
+        ranges
+      );
+    }
 
-        if (isSecurityVulnerability) {
-          return true;
+    return findings.filter(
+      (finding) => {
+        const canonicalFindingPath =
+          this.canonicalizeForMatching(
+            repositoryRoot,
+            finding.path
+          );
+
+        if (canonicalFindingPath === null) {
+          return false;
         }
-      }
 
-      // 3. Warning stilistici o file secondari: filtraggio per coordinate differenziali (R_patch)
-      let ranges = modifiedRanges.get(finding.path);
-      if (!ranges) {
-        for (const [filePath, r] of modifiedRanges.entries()) {
-          if (normalizedPath.endsWith(filePath.replace(/\\/g, '/'))) {
-            ranges = r;
-            break;
+        const isTargetFile =
+          canonicalTargetFiles.has(
+            canonicalFindingPath
+          );
+
+        if (
+          category === 'REPAIR' &&
+          isTargetFile
+        ) {
+          const isSecurityVulnerability =
+            finding.severity === 'ERROR' ||
+            Boolean(
+              finding.cweHierarchy &&
+              finding.cweHierarchy.length > 0
+            ) ||
+            Boolean(
+              finding.owaspCategory
+            );
+
+          if (isSecurityVulnerability) {
+            return true;
           }
         }
+
+        const ranges =
+          this.findRangesForPath(
+            canonicalFindingPath,
+            canonicalModifiedRanges
+          );
+
+        if (
+          ranges === undefined ||
+          ranges.length === 0
+        ) {
+          return false;
+        }
+
+        return ranges.some(
+          (range) =>
+            finding.endLine >=
+            range.start &&
+            finding.startLine <=
+            range.end
+        );
+      }
+    );
+  }
+
+  private static extractRangesFromHunk(hunk: ParsedHunk, isNewFile: boolean): LineRange[] {
+    if (isNewFile) {
+      const producedLineCount = hunk.lines.filter((line) => line.kind !== '-').length;
+
+      if (producedLineCount === 0) {
+        return [];
       }
 
-      if (!ranges || ranges.length === 0) {
-        return false;
+      const start = Math.max(1, hunk.newStart);
+
+      return [
+        {
+          start: start,
+          end: start + producedLineCount - 1
+        }
+      ];
+    }
+
+    const ranges: LineRange[] = [];
+    let newLine = Math.max(1, hunk.newStart);
+    let changeStart: number | null = null;
+    let changeEnd: number | null = null;
+
+    const flushChange = (): void => {
+      if (changeStart === null || changeEnd === null) {
+        changeStart = null;
+        changeEnd = null;
+        return;
       }
 
-      return ranges.some((r) => finding.startLine >= r.start && finding.startLine <= r.end);
-    });
+      ranges.push({
+        start: Math.max(1, changeStart - this.CONTEXT_LINES),
+        end: changeEnd + this.CONTEXT_LINES
+      });
+
+      changeStart = null;
+      changeEnd = null;
+    };
+
+    for (const line of hunk.lines) {
+      if (line.kind === ' ') {
+        flushChange();
+        newLine++;
+        continue;
+      }
+
+      if (line.kind === '+') {
+        if (changeStart === null) {
+          changeStart = newLine;
+        }
+
+        changeEnd = Math.max(changeStart, newLine);
+        newLine++;
+        continue;
+      }
+
+      if (line.kind === '-') {
+        if (changeStart === null) {
+          changeStart = newLine;
+        }
+
+        changeEnd = Math.max(changeStart, newLine);
+      }
+    }
+
+    flushChange();
+
+    return ranges;
+  }
+
+  private static findRangesForPath(
+    canonicalFindingPath: string,
+    modifiedRanges: ReadonlyMap<
+      string,
+      readonly LineRange[]
+    >
+  ): readonly LineRange[] | undefined {
+    return modifiedRanges.get(
+      canonicalFindingPath
+    );
+  }
+
+  private static mergeRanges(ranges: readonly LineRange[]): LineRange[] {
+    if (ranges.length === 0) {
+      return [];
+    }
+
+    const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
+
+    const merged: LineRange[] = [];
+
+    for (const range of sorted) {
+      const previous = merged[merged.length - 1];
+
+      if (!previous || range.start > previous.end + 1) {
+        merged.push({
+          start: range.start,
+          end: range.end
+        });
+
+        continue;
+      }
+
+      merged[merged.length - 1] = {
+        start: previous.start,
+        end: Math.max(previous.end, range.end)
+      };
+    }
+
+    return merged;
+  }
+
+  private static canonicalizeForMatching(
+    repositoryRoot: string,
+    candidatePath: string
+  ): string | null {
+    try {
+      return canonicalizeRepositoryPath({
+        repositoryRoot,
+        candidatePath
+      }).relativePath;
+    } catch (error: unknown) {
+      if (
+        error instanceof
+        RepositoryPathPolicyError
+      ) {
+        return null;
+      }
+
+      throw error;
+    }
+  }
+
+  private static normalizePath(filePath: string): string {
+    let normalized = filePath.replace(/\\/g, '/').trim();
+
+    while (normalized.startsWith('./')) {
+      normalized = normalized.substring(2);
+    }
+
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
   }
 }

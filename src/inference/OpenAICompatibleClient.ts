@@ -7,6 +7,7 @@ export interface InferenceConfig {
   readonly seed?: number;
   readonly temperature?: number;
   readonly topP?: number;
+  readonly inferenceTimeoutMs: number;
 }
 
 export interface ChatMessage {
@@ -28,13 +29,23 @@ interface ModelListResponse {
   readonly data?: ReadonlyArray<{ readonly id?: string }>;
 }
 
+export class InferenceTimeoutError extends Error {
+  constructor(
+    readonly timeoutMs: number,
+    readonly endpoint: string
+  ) {
+    super(`Timeout di inferenza dopo ${timeoutMs} ms verso ${endpoint}.`);
+    this.name = 'InferenceTimeoutError';
+  }
+}
+
 export class OpenAICompatibleClient {
   constructor(
     private readonly config: InferenceConfig,
     private readonly telemetryTracker: TelemetryTracker
-  ) {}
+  ) { }
 
-  public async validateEndpoint(timeoutMs = 5000): Promise<void> {
+  public async validateEndpoint(timeoutMs = 5_000): Promise<void> {
     const endpoint = `${this.config.baseUrl.replace(/\/+$/, '')}/models`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -47,20 +58,20 @@ export class OpenAICompatibleClient {
       const data = await response.json() as ModelListResponse;
       const availableModels = data.data?.flatMap((entry) => entry.id ? [entry.id] : []) ?? [];
       if (availableModels.length > 0 && !availableModels.includes(this.config.model)) {
-        throw new Error(`Modello '${this.config.model}' non esposto dall’endpoint. Disponibili: ${availableModels.join(', ')}.`);
+        throw new Error(`Modello '${this.config.model}' non esposto dall'endpoint. Disponibili: ${availableModels.join(', ')}.`);
       }
     } catch (error: unknown) {
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`Timeout ${timeoutMs} ms durante la verifica dell’endpoint modello.`);
+        throw new Error(`Timeout ${timeoutMs} ms durante la verifica dell'endpoint modello.`);
       }
-      throw new Error(`Impossibile verificare l’endpoint modello ${endpoint}: ${(error as Error).message}`);
+      throw new Error(`Impossibile verificare l'endpoint modello ${endpoint}: ${this.errorMessage(error)}`);
     } finally {
       clearTimeout(timeout);
     }
   }
 
   public async completeChat(messages: readonly ChatMessage[], role: AgentRole = 'CODER'): Promise<string> {
-    const t0 = performance.now();
+    const startedAt = performance.now();
     const endpoint = `${this.config.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
     const payload = {
@@ -72,35 +83,57 @@ export class OpenAICompatibleClient {
       stream: false
     };
 
-    let response: Response;
+    const controller = new AbortController();
+    let timeoutTriggered = false;
+    let promptTokens: number | null = null;
+    let completionTokens: number | null = null;
+
+    const timeout = setTimeout(
+      () => {
+        timeoutTriggered = true;
+        controller.abort();
+      },
+      this.config.inferenceTimeoutMs
+    );
+
     try {
-      response = await fetch(endpoint, {
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: controller.signal
       });
+      if (!response.ok) {
+        const errorBody = await response.text();
+
+        throw new Error(`Inference engine ha restituito HTTP ${response.status}: ${errorBody}`);
+      }
+      const data = await response.json() as ChatCompletionResponse;
+      promptTokens = data.usage?.prompt_tokens ?? null;
+      completionTokens = data.usage?.completion_tokens ?? null;
+      const content = data.choices[0]?.message.content;
+
+      if (typeof content !== 'string') {
+        throw new Error("L'engine di inferenza ha restituito un payload privo di scelte testuali valide.");
+      }
+
+      return content;
     } catch (err: unknown) {
-      throw new Error(`Connessione fallita verso l'engine locale (${endpoint}): ${(err as Error).message}`);
+      if (timeoutTriggered || (err instanceof Error && err.name === 'AbortError')) {
+        throw new InferenceTimeoutError(this.config.inferenceTimeoutMs, endpoint);
+      }
+      if (err instanceof InferenceTimeoutError) {
+        throw err;
+      }
+      throw new Error(`Connessione o inferenza fallita verso l'engine locale (${endpoint}): ${this.errorMessage(err)}`);
+    } finally {
+      clearTimeout(timeout);
+      const durationMs = performance.now() - startedAt;
+      this.telemetryTracker.recordLLMUsage(role, promptTokens, completionTokens, durationMs);
     }
+  }
 
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`Inference engine ha restituito HTTP ${response.status}: ${errBody}`);
-    }
-
-    const data = (await response.json()) as ChatCompletionResponse;
-    const durationMs = performance.now() - t0;
-
-    const promptTokens = data.usage?.prompt_tokens ?? 0;
-    const completionTokens = data.usage?.completion_tokens ?? 0;
-
-    this.telemetryTracker.recordLLMUsage(role, promptTokens, completionTokens, durationMs);
-
-    const content = data.choices[0]?.message.content;
-    if (typeof content !== 'string') {
-      throw new Error("L'engine di inferenza ha restituito un payload prive di scelte testuali valide.");
-    }
-
-    return content;
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 }

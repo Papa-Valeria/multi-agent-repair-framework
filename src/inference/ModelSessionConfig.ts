@@ -11,13 +11,13 @@ const localApiBaseUrl = z.string().url().superRefine((value, context) => {
   if (!loopbackHosts.has(url.hostname.toLowerCase())) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'L’endpoint del modello deve essere locale (localhost o loopback IP).'
+      message: 'L\'endpoint del modello deve essere locale (localhost o loopback IP).'
     });
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     context.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'L’endpoint deve usare HTTP o HTTPS.'
+      message: 'L\'endpoint deve usare HTTP o HTTPS.'
     });
   }
 }).transform((value) => value.replace(/\/+$/, ''));
@@ -27,7 +27,8 @@ export const modelSessionConfigSchema = z.object({
   modelIdentifier: z.string().trim().min(1).max(200),
   seed: z.number().int().min(0).max(2_147_483_647),
   temperature: z.number().min(0).max(2),
-  topP: z.number().gt(0).max(1)
+  topP: z.number().gt(0).max(1),
+  inferenceTimeoutMs: z.number().int().min(1_000).max(600_000)
 }).strict();
 
 export type ModelSessionConfig = z.infer<typeof modelSessionConfigSchema>;
@@ -37,5 +38,6 @@ export const DEFAULT_MODEL_SESSION_CONFIG: ModelSessionConfig = Object.freeze({
   modelIdentifier: 'qwen2.5-coder:7b',
   seed: 42,
   temperature: 0,
-  topP: 1
+  topP: 1,
+  inferenceTimeoutMs: 120_000
 });

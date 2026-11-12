@@ -1,95 +1,198 @@
-import { OpenAICompatibleClient, ChatMessage } from '../inference/OpenAICompatibleClient.js';
+import { OpenAICompatibleClient, type ChatMessage } from '../inference/OpenAICompatibleClient.js';
+import type { ExperimentCategory } from '../types/analytics.js';
+import { DEFAULT_PROMPT_PROFILE } from '../inference/PromptProfile.js';
+import type { PromptProfile } from '../inference/PromptProfile.js';
+import { parseFileDiffs } from '../git/UnifiedDiff.js';
+
+export class CoderModelInvocationError
+  extends Error {
+  constructor(
+    message: string,
+    readonly originalError?: unknown
+  ) {
+    super(message);
+    this.name =
+      'CoderModelInvocationError';
+  }
+}
+
+export class CoderOutputExtractionError
+  extends Error {
+  constructor(
+    message: string,
+    readonly originalError?: unknown
+  ) {
+    super(message);
+    this.name =
+      'CoderOutputExtractionError';
+  }
+}
+
+interface FencedCodeBlock {
+  readonly language: string;
+  readonly content: string;
+}
 
 export class CoderAgent {
-  private static readonly SYSTEM_PROMPT = `You are an autonomous software engineering agent specialized in precise code modifications and module synthesis.
-Your task is to produce a valid Unified Diff patch to satisfy the requirements on the target codebase.
-
-CRITICAL OPERATIONAL CONSTRAINTS:
-1. You MUST generate ONLY a valid Unified Diff patch enclosed in a single \`\`\`diff ... \`\`\` block.
-2. Do NOT touch, modify, or patch any TEST files. Test suites are immutable validation oracles.
-3. Modify or create ONLY the target source files specified in the request.
-4. Do NOT write any conversational text, explanations, or markdown outside the diff block.
-5. ZERO CONTEXT AMBIGUITY: Every single line you alter must have prefix '-', every new line must have prefix '+'.
-6. Context lines before and after changes must match the target files VERBATIM when modifying existing files.
-7. CRITICAL: The repository working tree is ALWAYS RESET to clean HEAD before every iteration.
-8. NEW FILE CREATION: If creating a new file from scratch, use the standard Git syntax:
-   diff --git a/<path> b/<path>
-   new file mode 100644
-   --- /dev/null
-   +++ b/<path>
-   @@ -0,0 +1,<num_lines> @@
-   followed by all synthesized code lines, each prefixed with '+'.`;
-
-  constructor(private readonly client: OpenAICompatibleClient) { }
+  constructor(
+    private readonly client: OpenAICompatibleClient,
+    private readonly promptProfile: PromptProfile = DEFAULT_PROMPT_PROFILE
+  ) { }
 
   private static bindToTarget(content: string, target: string): string {
-    if (!content.includes('@@')) return content;
-    const isNewFile = content.includes('--- /dev/null');
-    const headerPattern = /^--- [^\n]*\n\+\+\+ [^\n]*$/m;
-
-    if (!headerPattern.test(content)) {
-      const oldHeader = isNewFile ? '--- /dev/null' : `--- a/${target}`;
-      return `${oldHeader}\n+++ b/${target}\n${content}`;
+    if (!content.includes('@@')) {
+      return content;
     }
 
-    const paths = new Set([...content.matchAll(/^\+\+\+ (?:b\/)?(\S+)/gm)].map((match) => match[1]));
-    if (paths.size !== 1 || paths.has(target)) return content;
+    const hasFileHeader = /^--- [^\n]+\n\+\+\+ [^\n]+$/m.test(content);
 
-    const oldHeader = isNewFile ? '--- /dev/null' : `--- a/${target}`;
-    return content
-      .replace(/^diff --git .*$/gm, `diff --git a/${target} b/${target}`)
-      .replace(/^--- [^\n]*\n\+\+\+ [^\n]*$/gm, `${oldHeader}\n+++ b/${target}`);
+    if (hasFileHeader) {
+      return content;
+    }
+
+    return `--- a/${target}\n+++ b/${target}\n${content}`;
   }
 
-  private static isTestPath(filePath: string): boolean {
-    const segments = filePath.split('/');
-    const name = segments[segments.length - 1] ?? '';
-    return (
-      /^test_.*\.py$\vert{}_test\.py$|^conftest\.py$\vert{}\.(?:test\vert{}spec)\.[cm]?[jt]sx?$/.test(name) ||
-      segments.slice(0, -1).some((segment) => segment === 'tests' || segment === 'test')
+  private static normalizePath(filePath: string): string {
+    let normalized = filePath.replaceAll('\\', '/').trim();
+
+    while (normalized.startsWith('./')) {
+      normalized = normalized.substring(2);
+    }
+
+    if (normalized.startsWith('a/') || normalized.startsWith('b/')) {
+      normalized = normalized.substring(2);
+    }
+
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  }
+
+
+  public async generatePatch(
+    userPromptPayload: string,
+    targetFiles: readonly string[] = [],
+    testFiles: readonly string[] = [],
+    category: ExperimentCategory,
+  ): Promise<string> {
+    const messages: readonly ChatMessage[] = [
+      { role: 'system', content: this.promptProfile.coder.systemInstructions },
+      { role: 'user', content: userPromptPayload }
+    ];
+
+    let rawOutput: string;
+    try {
+      rawOutput = await this.client.completeChat(messages, 'CODER');
+    } catch (error: unknown) {
+      if (error instanceof CoderModelInvocationError) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new CoderModelInvocationError(
+        message.trim().length > 0 ?
+          message :
+          'Invocazione del modello Coder fallita senza dettagli.',
+        error
+      );
+    }
+    return this.extractDiff(
+      rawOutput,
+      targetFiles,
+      testFiles,
+      category
     );
   }
 
-  public async generatePatch(userPromptPayload: string, targetFiles: readonly string[] = []): Promise<string> {
-    const messages: readonly ChatMessage[] = [
-      { role: 'system', content: CoderAgent.SYSTEM_PROMPT },
-      { role: 'user', content: userPromptPayload }
-    ];
-    const rawOutput = await this.client.completeChat(messages, 'CODER');
-    return this.extractDiff(rawOutput, targetFiles);
+  private static extractFencedBlocks(rawResponse: string): FencedCodeBlock[] {
+    const blocks: FencedCodeBlock[] = [];
+    const fencePattern = /```([^\r\n`]*)\r?\n([\s\S]*?)```/g;
+    for (const match of rawResponse.matchAll(fencePattern)) {
+      const language = match[1]?.trim().toLowerCase() ?? '';
+      const content = match[2]?.trim().replace(/\r\n/g, '\n') ?? '';
+      if (content.length === 0) continue;
+      blocks.push({ language, content });
+    }
+    return blocks;
   }
 
-  public extractDiff(rawResponse: string, targetFiles: readonly string[] = []): string {
+  private static isRecognizableUnifiedDiff(content: string, targetFiles: readonly string[], category: ExperimentCategory): boolean {
+    const normalized = content.trim().replace(/\r\n/g, '\n');
+    if (normalized.length === 0) {
+      return false;
+    }
+    if (parseFileDiffs(normalized).length > 0) {
+      return true;
+    }
+    if (category !== 'REPAIR' || targetFiles.length !== 1) {
+      return false;
+    }
+    const boundCandidate = CoderAgent.bindToTarget(normalized, targetFiles[0]!);
+    return parseFileDiffs(boundCandidate).length > 0;
+  }
+
+  private static selectDiffCandidate(rawResponse: string, targetFiles: readonly string[], category: ExperimentCategory): string {
+    const fencedBlocks = CoderAgent.extractFencedBlocks(rawResponse);
+    const explicitDiffBlocks = fencedBlocks.filter((block) => block.language === 'diff');
+    if (explicitDiffBlocks.length > 1) {
+      throw new CoderOutputExtractionError(`La risposta contiene più blocchi contrassegnati come diff e non consente di selezionare deterministicamente una singola patch`);
+    }
+    if (explicitDiffBlocks.length === 1) {
+      return explicitDiffBlocks[0]!.content;
+    }
+    const recognizableFencedBlocks = fencedBlocks.filter((block) => CoderAgent.isRecognizableUnifiedDiff(block.content, targetFiles, category));
+    if (recognizableFencedBlocks.length > 1) {
+      throw new CoderOutputExtractionError(`La risposta contiene più code fence con struttura Unified Diff riconoscibile e la selezione della patch è ambigua.`);
+    }
+    if (recognizableFencedBlocks.length === 1) {
+      return recognizableFencedBlocks[0]!.content;
+    }
+    if (fencedBlocks.length === 0 && CoderAgent.isRecognizableUnifiedDiff(rawResponse, targetFiles, category)) {
+      return rawResponse.trim().replace(/\r\n/g, '\n');
+    }
+    throw new CoderOutputExtractionError(`La risposta generata non contiene un candidato Unified Diff riconoscibile`);
+  }
+
+  public extractDiff(rawResponse: string, targetFiles: readonly string[] = [], testFiles: readonly string[] = [], category: ExperimentCategory): string {
     if (!rawResponse.trim()) {
-      throw new Error('Il modello ha restituito una risposta vuota (0 token utili).');
+      throw new CoderOutputExtractionError('Il modello ha restituito una risposta vuota (0 token utili).');
     }
 
-    const match = /```(?:diff)?\s*([\s\S]*?)\s*```/i.exec(rawResponse);
-    let content = match && match[1] ? match[1].trim() : rawResponse.trim();
-    content = content.replace(/\\"/g, '"').replace(/\\'/g, "'");
+    let content = CoderAgent.selectDiffCandidate(rawResponse, targetFiles, category);
     content = content.replace(/\r\n/g, '\n');
+    const protectedFiles = new Set(testFiles.map((file) => CoderAgent.normalizePath(file)));
+    const diffPaths = content.split('\n').filter((line) => line.startsWith('--- ') || line.startsWith('+++ ')).map((line) => {
+      const headerValue = line.substring(4).trim();
+
+      return headerValue.split(/\t/)[0]?.trim() ?? '';
+    })
+      .filter((filePath) => filePath.length > 0 && filePath !== '/dev/null');
+
+    for (const diffPath of diffPaths) {
+      const normalizedPath = CoderAgent.normalizePath(diffPath);
+      if (protectedFiles.has(normalizedPath)) {
+        throw new CoderOutputExtractionError(`La patch generata tenta di modificare un file di test/oracolo protetto: ${normalizedPath}`);
+      }
+    }
 
     const fileDiffs = content.split(/(?=diff --git )/g);
-    const sanitizedDiffs = fileDiffs.filter((block) => {
+    for (const block of fileDiffs) {
       const headerMatch = block.match(/diff --git a\/(\S+) b\/(\S+)/);
-      if (!headerMatch) return true;
-      const targetPath = headerMatch[2] ?? '';
-      if (CoderAgent.isTestPath(targetPath)) {
-        console.warn(`[CoderAgent] Rimosso hunk illegale sul file di test: ${targetPath}`);
-        return false;
+      if (!headerMatch) continue;
+      const oldPath = CoderAgent.normalizePath(headerMatch[1] ?? '');
+      const newPath = CoderAgent.normalizePath(headerMatch[2] ?? '');
+      if (protectedFiles.has(oldPath) || protectedFiles.has(newPath)) {
+        throw new CoderOutputExtractionError(`La patch generata tenta di modificare un file di test/oracolo protetto: ${newPath || oldPath}`);
       }
-      return true;
-    });
+    }
 
-    content = sanitizedDiffs.join('').trim();
-    if (targetFiles.length === 1) content = CoderAgent.bindToTarget(content, targetFiles[0]!);
+    if (category === 'REPAIR' && targetFiles.length === 1) {
+      content = CoderAgent.bindToTarget(content, targetFiles[0]!);
+    }
 
-    // Normalizzazione agnostica degli header diff: preserva esplicitamente /dev/null
     content = content.replace(/^--- (?!a\/|\/dev\/null)(\S+)/gm, '--- a/$1');
     content = content.replace(/^\+\+\+ (?!b\/)(\S+)/gm, '+++ b/$1');
 
     if (!content.includes('--- ') || !content.includes('+++ ')) {
-      throw new Error('La risposta generata non contiene un blocco Unified Diff valido.');
+      throw new CoderOutputExtractionError('La risposta generata non contiene un blocco Unified Diff valido.');
     }
 
     return content;

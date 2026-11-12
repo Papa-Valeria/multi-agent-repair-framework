@@ -4,11 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:server": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json",
     "start:server": "tsx src/server/app.ts",
     "dev:client": "vite client",
     "build:client": "vite build client",
-    "benchmark:run": "tsx benchmarks/BenchmarkRunner.ts",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --detectOpenHandles"
   },
   "dependencies": {

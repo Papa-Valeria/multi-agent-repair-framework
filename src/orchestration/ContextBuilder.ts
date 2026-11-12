@@ -1,13 +1,32 @@
 import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
-import { ReviewerFeedbackPayload } from '../types/domain.js';
-import { ExperimentCategory } from '../types/analytics.js';
+import {
+  resolveRepositoryPath
+} from '../security/RepositoryPathPolicy.js';
+import type {
+  CumulativeRemediation,
+  FunctionalTestOracleConfig,
+  ReviewerFeedbackPayload
+} from '../types/domain.js';
+import type { ExperimentCategory } from '../types/analytics.js';
+import type { BuildOracleConfig } from '../inference/BuildOracleConfig.js';
+import { DEFAULT_PROMPT_PROFILE } from '../inference/PromptProfile.js';
+import type { PromptProfile } from '../inference/PromptProfile.js';
 
 export interface InitialContextParams {
   readonly issueSpec: string;
   readonly targetFiles: readonly string[];
   readonly testFiles: readonly string[];
-  readonly category?: ExperimentCategory;
+  readonly category: ExperimentCategory;
+  readonly buildOracleConfig?: BuildOracleConfig;
+  readonly functionalTestOracleConfig?: FunctionalTestOracleConfig;
+}
+
+export interface RefinementContextParams {
+  readonly iteration: number;
+  readonly previousCandidatePatch?: string;
+  readonly currentFeedback: ReviewerFeedbackPayload;
+  readonly cumulativeRemediations: readonly CumulativeRemediation[];
+  readonly currentFailure: string;
 }
 
 interface BaseContext {
@@ -20,106 +39,239 @@ interface BaseContext {
 export class ContextBuilder {
   private baseContext: BaseContext | null = null;
 
-  constructor(private readonly repoRoot: string) { }
+  constructor(
+    private readonly repoRoot: string,
+    private readonly promptProfile: PromptProfile = DEFAULT_PROMPT_PROFILE
+  ) { }
 
-  public async buildInitialPayload(params: InitialContextParams): Promise<string> {
-    const category = params.category ?? 'REPAIR';
-    const targets: Record<string, string> = {};
+  public async buildInitialPayload(
+    params: InitialContextParams
+  ): Promise<string> {
+    const category =
+      params.category;
 
-    for (const relPath of params.targetFiles) {
-      const full = path.join(this.repoRoot, relPath);
+    const targets:
+      Record<string, string> = {};
+
+    for (
+      const relPath of
+      params.targetFiles
+    ) {
+      const resolved =
+        await resolveRepositoryPath({
+          repositoryRoot:
+            this.repoRoot,
+
+          relativePath:
+            relPath,
+
+          allowMissing:
+            category === 'CREATE'
+        });
+
       try {
-        targets[relPath] = await fs.readFile(full, 'utf-8');
+        const content =
+          await fs.readFile(
+            resolved.absolutePath,
+            'utf8'
+          );
+
+        targets[
+          resolved.relativePath
+        ] = content;
       } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT' || category === 'CREATE') {
-          targets[relPath] =
-            '[NEW FILE TO CREATE: The file does not exist yet. Synthesize the complete implementation from scratch to satisfy the testContracts and issueSpec]';
+        const error =
+          err as NodeJS.ErrnoException;
+
+        if (
+          error.code === 'ENOENT' &&
+          category === 'CREATE'
+        ) {
+          targets[resolved.relativePath] = this.promptProfile.contextBuilder.newFileTargetMarker;
         } else {
           throw err;
         }
       }
     }
 
-    const testContracts: Record<string, string> = {};
-    for (const testPath of params.testFiles) {
-      const full = path.join(this.repoRoot, testPath);
-      try {
-        const content = await fs.readFile(full, 'utf-8');
-        testContracts[testPath] = this.extractSignaturesAndAssertions(content);
-      } catch (err: unknown) {
-        testContracts[testPath] = `# Impossibile leggere il file di test: ${(err as Error).message}`;
-      }
+    const testContracts:
+      Record<string, string> = {};
+
+    for (
+      const testPath of
+      params.testFiles
+    ) {
+      const resolved =
+        await resolveRepositoryPath({
+          repositoryRoot:
+            this.repoRoot,
+
+          relativePath:
+            testPath
+        });
+      const content =
+        await fs.readFile(
+          resolved.absolutePath,
+          'utf8'
+        );
+
+      testContracts[
+        resolved.relativePath
+      ] = content;
     }
 
-    this.baseContext = { issueSpec: params.issueSpec, targets, testContracts, category };
+    this.baseContext = {
+      issueSpec:
+        params.issueSpec,
 
-    const modeDirective = category === 'CREATE'
-      ? 'MODE: CREATE (GREEN-FIELD SYNTHESIS). The target module does not exist on disk. Synthesize the complete module from scratch using the Git new-file syntax (--- /dev/null).'
-      : 'MODE: REPAIR (BUG FIXING / REFACTORING). The target module exists. Produce minimal diff modifications to fix issues and pass tests.';
+      targets,
 
+      testContracts,
+
+      category
+    };
+
+    const modeDirective =
+      category === 'CREATE'
+        ? this.promptProfile
+          .contextBuilder
+          .createModeDirective
+        : this.promptProfile
+          .contextBuilder
+          .repairModeDirective;
     return `=== INITIAL ${category} REQUEST ===
 ISSUE: ${params.issueSpec}
 ${modeDirective}
 
 ${this.renderContext(this.baseContext)}
 
-${category === 'CREATE' ? ContextBuilder.CREATE_DIFF_INSTRUCTIONS : ContextBuilder.DIFF_INSTRUCTIONS}`;
+${category === 'CREATE'
+        ? this.promptProfile
+          .contextBuilder
+          .createDiffInstructions
+        : this.promptProfile
+          .contextBuilder
+          .diffInstructions}`;
   }
 
-  public buildRefinementPayload(
-    _previousPayload: string,
-    previousDiff: string,
-    feedback: ReviewerFeedbackPayload
-  ): string {
+  public buildRefinementPayload(params: RefinementContextParams): string {
     const base = this.baseContext;
     if (!base) {
       throw new Error('buildRefinementPayload richiede una chiamata precedente a buildInitialPayload.');
     }
 
-    const remediationsText = feedback.targetRemediations
-      .map(
-        (r, i) =>
-          `${i + 1}. [${r.file}] Root Cause: ${r.rootCause}\n   Mandatory Correction: ${r.mandatoryCorrection}`
-      )
-      .join('\n');
+    const {
+      iteration,
+      previousCandidatePatch,
+      currentFeedback,
+      cumulativeRemediations,
+      currentFailure
+    } = params;
+
+    if (cumulativeRemediations.length === 0) {
+      throw new Error('Il refinement richiede almeno una remediation cumulativa.');
+    }
+
+    const previousPatchSection = previousCandidatePatch?.trim() ? `PREVIOUS CANDIDATE PATCH:
+The following patch was evaluated in the previous iteration and has now been rolled back.
+
+It is evidence of the complete set of changes attempted previously, but it is not the current repository state.
+
+Preserve its still-valid changes in the replacement patch. Remove or replace a previous change only when it conflicts with:
+- the original issue specification;
+- current oracle evidence;
+- a cumulative mandatory correction;
+- repository scope or protected-test constraints.
+
+${ContextBuilder.fence(previousCandidatePatch)}`
+      : `PREVIOUS CANDIDATE PATCH:
+No usable candidate patch is available from the previous iteration.`;
+
+    const remediationsText = cumulativeRemediations.map((entry, index) => {
+      const remediation = entry.remediation;
+      return [
+        `${index + 1}. [${remediation.file}]`,
+        `   Line range: ${remediation.lineRange.start}-${remediation.lineRange.end}`,
+        `   First observed: iteration ${entry.firstObservedIteration}`,
+        `   Last observed: iteration ${entry.lastObservedIteration}`,
+        `   Observation count: ${entry.observationCount}`,
+        `   Root Cause: ${remediation.rootCause}`,
+        `   Mandatory Correction: ${remediation.mandatoryCorrection}`,
+        remediation.relatedRuleId
+          ? `   Related Rule: ${remediation.relatedRuleId}`
+          : ''
+      ]
+        .filter((line) => line.length > 0)
+        .join('\n');
+    })
+      .join('\n\n');
 
     return `=== REFINEMENT REQUEST (${base.category}) ===
-The previous patch was REJECTED by deterministic oracles and the repository has been reset to clean HEAD.
-ISSUE: ${base.issueSpec}
 
+REFINEMENT ITERATION:
+${iteration}
+
+REPOSITORY STATE:
+- The previous candidate patch was rejected and has been completely rolled back.
+- The repository is currently at its original clean HEAD.
+- The TARGET FILE contents below are the only authoritative source state.
+- Generate a complete new Unified Diff against these exact original contents.
+- Do not treat any previous candidate patch as the current repository state.
+- Do not reproduce previously diagnosed faulty behavior.
+
+ORIGINAL ISSUE SPECIFICATION:
+${base.issueSpec}
+
+AUTHORITATIVE ORIGINAL CONTEXT:
 ${this.renderContext(base)}
 
-PREVIOUS REJECTED PATCH:
-\`\`\`diff
-${previousDiff}
-\`\`\`
+${previousPatchSection}
 
-DIAGNOSTIC FEEDBACK FROM ORACLES (SEMGREP / TEST HARNESS):
-Summary: ${feedback.rootCauseSummary}
-Prescribed Fixes:
+CURRENT FAILURE:
+${currentFailure}
+
+CURRENT ORACLE DIAGNOSIS:
+${currentFeedback.rootCauseSummary}
+
+CUMULATIVE MANDATORY CORRECTIONS:
 ${remediationsText}
 
-Generate a NEW and DIFFERENT patch directly against the TARGET files above. Ensure you satisfy BOTH security oracles and test assertions.
-${base.category === 'CREATE' ? ContextBuilder.CREATE_DIFF_INSTRUCTIONS : ContextBuilder.DIFF_INSTRUCTIONS}`;
+${this.promptProfile.contextBuilder.refinementInstructions}
+${base.category === 'CREATE'
+        ? this.promptProfile
+          .contextBuilder
+          .createRefinementDirective
+        : this.promptProfile
+          .contextBuilder
+          .repairRefinementDirective}
+${base.category === 'CREATE'
+        ? this.promptProfile
+          .contextBuilder
+          .createDiffInstructions
+        : this.promptProfile
+          .contextBuilder
+          .diffInstructions}`;
   }
 
-  private static readonly DIFF_INSTRUCTIONS = `OUTPUT RULES:
-- Output ONLY one \`\`\`diff block and nothing else.
-- Every context line (prefix ' ') and every removed line (prefix '-') MUST be copied character-for-character from the TARGET FILE above, including indentation. Never invent, reorder or paraphrase them.
-- Use at most 3 context lines around each change.
-- Added lines use the prefix '+' and must keep the file's indentation style.
-- Hunk header line numbers are informational; the exact text of the lines decides where the patch applies.`;
+  public buildTechnicalRetryPayload(semanticPayload: string, rejectedPatch: string, applicabilitySummary: string, attempt: number): string {
+    return `${semanticPayload}
+    === UNIFIED DIFF TECHNICAL RETRY ===
 
-  private static readonly CREATE_DIFF_INSTRUCTIONS = `OUTPUT RULES (NEW FILE SYNTHESIS):
-- Output ONLY one \`\`\`diff block and nothing else.
-- To create a new file, format the diff header strictly as:
-  diff --git a/<targetFile> b/<targetFile>
-  new file mode 100644
-  --- /dev/null
-  +++ b/<targetFile>
-  @@ -0,0 +1,<num_lines> @@
-- Every single line of the synthesized code MUST start with '+'.
-- Do not add conversational text, markdown explanation, or comments outside the diff block.`;
+TECHNICAL ATTEMPT:
+${attempt}
+
+The previous candidate was rejected by the Applicability Oracle.
+
+APPLICABILITY DIAGNOSIS:
+${applicabilitySummary}
+
+REJECTED CANDIDATE PATCH:
+${ContextBuilder.fence(rejectedPatch)}
+
+${this.promptProfile
+        .contextBuilder
+        .technicalRetryInstructions}`;
+  }
 
   private renderContext(base: BaseContext): string {
     const targetBlocks = Object.entries(base.targets)
@@ -137,12 +289,5 @@ ${base.category === 'CREATE' ? ContextBuilder.CREATE_DIFF_INSTRUCTIONS : Context
     const longestRun = Math.max(2, ...(content.match(/`+/g) ?? []).map((run) => run.length));
     const marker = '`'.repeat(longestRun + 1);
     return `${marker}\n${content.replace(/\r\n/g, '\n')}\n${marker}`;
-  }
-
-  private extractSignaturesAndAssertions(testSource: string): string {
-    return testSource
-      .split('\n')
-      .filter((l) => l.includes('def test_') || l.includes('assert ') || l.includes('it(') || l.includes('expect('))
-      .join('\n');
   }
 }
